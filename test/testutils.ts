@@ -1,7 +1,9 @@
 import { ethers } from 'hardhat'
+import { toHex } from 'hardhat/internal/util/bigint'
 import {
   arrayify,
-  hexConcat, hexDataSlice,
+  hexConcat,
+  hexDataSlice,
   hexlify,
   hexZeroPad,
   Interface,
@@ -20,11 +22,15 @@ import {
   TestAggregatedAccountFactory, TestPaymasterRevertCustomError__factory, TestERC20__factory
 } from '../typechain'
 import { BytesLike, Hexable } from '@ethersproject/bytes'
+import { JsonRpcProvider } from '@ethersproject/providers'
 import { expect } from 'chai'
 import { Create2Factory } from '../src/Create2Factory'
 import { debugTransaction } from './debugTx'
 import { UserOperation } from './UserOperation'
 import { packUserOp, simulateValidation } from './UserOp'
+import Debug from 'debug'
+
+const debug = Debug('testutils')
 
 export const AddressZero = ethers.constants.AddressZero
 export const HashZero = ethers.constants.HashZero
@@ -83,7 +89,7 @@ export function callDataCost (data: string): number {
     .reduce((sum, x) => sum + x)
 }
 
-export async function calcGasUsage (rcpt: ContractReceipt, entryPoint: EntryPoint, beneficiaryAddress?: string): Promise<{ actualGasCost: BigNumberish }> {
+export async function calcGasUsage (rcpt: ContractReceipt, entryPoint: EntryPoint, beneficiaryAddress?: string): Promise<{ actualGasCost: BigNumber }> {
   const actualGas = await rcpt.gasUsed
   const logs = await entryPoint.queryFilter(entryPoint.filters.UserOperationEvent(), rcpt.blockHash)
   const { actualGasCost, actualGasUsed } = logs[0].args
@@ -217,17 +223,17 @@ export async function checkForGeth (): Promise<void> {
 
   currentNode = await provider.request({ method: 'web3_clientVersion' })
 
-  console.log('node version:', currentNode)
+  debug('node version:', currentNode)
   // NOTE: must run geth with params:
   // --http.api personal,eth,net,web3
   // --allow-insecure-unlock
-  if (currentNode.match(/geth/i) != null) {
-    for (let i = 0; i < 2; i++) {
-      const acc = await provider.request({ method: 'personal_newAccount', params: ['pass'] }).catch(rethrow)
-      await provider.request({ method: 'personal_unlockAccount', params: [acc, 'pass'] }).catch(rethrow)
-      await fund(acc, '10')
-    }
-  }
+  // if (currentNode.match(/geth/i) != null) {
+  //   for (let i = 0; i < 2; i++) {
+  //     const acc = await provider.request({ method: 'personal_newAccount', params: ['pass'] }).catch(rethrow())
+  //     await provider.request({ method: 'personal_unlockAccount', params: [acc, 'pass'] }).catch(rethrow())
+  //     await fund(acc, '10')
+  //   }
+  // }
 }
 
 // remove "array" members, convert values to strings.
@@ -298,7 +304,11 @@ export async function createAccount (
   }> {
   const accountFactory = _factory ?? await new SimpleAccountFactory__factory(ethersSigner).deploy(entryPoint)
   const implementation = await accountFactory.accountImplementation()
-  await accountFactory.createAccount(accountOwner, 0)
+  const entryPointContract = EntryPoint__factory.connect(entryPoint, ethersSigner)
+  const senderCreator = await entryPointContract.senderCreator()
+  await (ethersSigner.provider as JsonRpcProvider).send('hardhat_setBalance', [senderCreator, toHex(100e18)])
+  const senderCreatorSigner = await ethers.getImpersonatedSigner(senderCreator)
+  await accountFactory.connect(senderCreatorSigner).createAccount(accountOwner, 0)
   const accountAddress = await accountFactory.getAddress(accountOwner, 0)
   const proxy = SimpleAccount__factory.connect(accountAddress, ethersSigner)
   return {
@@ -323,6 +333,10 @@ export function packPaymasterData (paymaster: string, paymasterVerificationGasLi
 
 export function unpackAccountGasLimits (accountGasLimits: string): { verificationGasLimit: number, callGasLimit: number } {
   return { verificationGasLimit: parseInt(accountGasLimits.slice(2, 34), 16), callGasLimit: parseInt(accountGasLimits.slice(34), 16) }
+}
+
+export function unpackAccountGasFees (accountGasFees: string): { maxPriorityFeePerGas: number, maxFeePerGas: number } {
+  return { maxPriorityFeePerGas: parseInt(accountGasFees.slice(2, 34), 16), maxFeePerGas: parseInt(accountGasFees.slice(34), 16) }
 }
 
 export interface ValidationData {

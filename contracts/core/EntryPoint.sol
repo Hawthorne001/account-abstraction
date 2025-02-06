@@ -5,18 +5,19 @@ pragma solidity ^0.8.23;
 
 import "../interfaces/IAccount.sol";
 import "../interfaces/IAccountExecute.sol";
-import "../interfaces/IPaymaster.sol";
 import "../interfaces/IEntryPoint.sol";
+import "../interfaces/IPaymaster.sol";
 
 import "../utils/Exec.sol";
-import "./StakeManager.sol";
-import "./SenderCreator.sol";
 import "./Helpers.sol";
 import "./NonceManager.sol";
+import "./SenderCreator.sol";
+import "./StakeManager.sol";
 import "./UserOperationLib.sol";
 
+import "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import "@openzeppelin/contracts/utils/introspection/ERC165.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 
 /*
  * Account-Abstraction (EIP-4337) singleton EntryPoint implementation.
@@ -24,13 +25,19 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
  */
 
 /// @custom:security-contact https://bounty.ethereum.org
-contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard, ERC165 {
+contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuardTransient, ERC165, EIP712 {
 
     using UserOperationLib for PackedUserOperation;
 
     SenderCreator private immutable _senderCreator = new SenderCreator();
 
-    function senderCreator() internal view virtual returns (SenderCreator) {
+    string constant internal DOMAIN_NAME = "ERC4337";
+    string constant internal DOMAIN_VERSION = "1";
+
+    constructor() EIP712(DOMAIN_NAME, DOMAIN_VERSION)  {
+    }
+
+    function senderCreator() public view virtual returns (ISenderCreator) {
         return _senderCreator;
     }
 
@@ -359,12 +366,20 @@ contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard,
         }
     }
 
+    function getPackedUserOpTypeHash() public pure returns (bytes32) {
+        return UserOperationLib.PACKED_USEROP_TYPEHASH;
+    }
+
+    function getDomainSeparatorV4() public virtual view returns (bytes32) {
+        return _domainSeparatorV4();
+    }
+
     /// @inheritdoc IEntryPoint
     function getUserOpHash(
         PackedUserOperation calldata userOp
     ) public view returns (bytes32) {
         return
-            keccak256(abi.encode(userOp.hash(), address(this), block.chainid));
+            MessageHashUtils.toTypedDataHash(getDomainSeparatorV4(), userOp.hash());
     }
 
     /**
@@ -546,7 +561,7 @@ contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard,
             } catch {
                 revert FailedOpWithRevert(opIndex, "AA33 reverted", Exec.getReturnData(REVERT_REASON_MAX_LEN));
             }
-            if (preGas - gasleft() > pmVerificationGasLimit) {
+            if (preGas - gasleft() > _getVerificationGasLimit(pmVerificationGasLimit)) {
                 revert FailedOp(opIndex, "AA36 over paymasterVerificationGasLimit");
             }
         }
@@ -652,7 +667,7 @@ contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard,
         }
 
         unchecked {
-            if (preGas - gasleft() > verificationGasLimit) {
+            if (preGas - gasleft() > _getVerificationGasLimit(verificationGasLimit)) {
                 revert FailedOp(opIndex, "AA26 over verificationGasLimit");
             }
         }
@@ -671,6 +686,12 @@ contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard,
             outOpInfo.contextOffset = getOffsetOfMemoryBytes(context);
             outOpInfo.preOpGas = preGas - gasleft() + userOp.preVerificationGas;
         }
+    }
+
+    // return verification gas limit.
+    // This method is overridden in EntryPointSimulations, for slightly stricter gas limits.
+    function _getVerificationGasLimit(uint256 verificationGasLimit) internal pure virtual returns (uint256) {
+        return verificationGasLimit;
     }
 
     /**
@@ -695,12 +716,20 @@ contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard,
             uint256 gasPrice = getUserOpGasPrice(mUserOp);
 
             address paymaster = mUserOp.paymaster;
+            // Calculating a penalty for unused execution gas
+            {
+                uint256 executionGasUsed = actualGas - opInfo.preOpGas;
+                // this check is required for the gas used within EntryPoint and not covered by explicit gas limits
+                actualGas += _getUnusedGasPenalty(executionGasUsed, mUserOp.callGasLimit);
+            }
+            uint256 postOpUnusedGasPenalty;
             if (paymaster == address(0)) {
                 refundAddress = mUserOp.sender;
             } else {
                 refundAddress = paymaster;
                 if (context.length > 0) {
                     actualGasCost = actualGas * gasPrice;
+                    uint256 postOpPreGas = gasleft();
                     if (mode != IPaymaster.PostOpMode.postOpReverted) {
                         try IPaymaster(paymaster).postOp{
                             gas: mUserOp.paymasterPostOpGasLimit
@@ -711,22 +740,12 @@ contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard,
                             revert PostOpReverted(reason);
                         }
                     }
+                    // Calculating a penalty for unused postOp gas
+                    uint256 postOpGasUsed = postOpPreGas - gasleft();
+                    postOpUnusedGasPenalty = _getUnusedGasPenalty(postOpGasUsed, mUserOp.paymasterPostOpGasLimit);
                 }
             }
-            actualGas += preGas - gasleft();
-
-            // Calculating a penalty for unused execution gas
-            {
-                uint256 executionGasLimit = mUserOp.callGasLimit + mUserOp.paymasterPostOpGasLimit;
-                uint256 executionGasUsed = actualGas - opInfo.preOpGas;
-                // this check is required for the gas used within EntryPoint and not covered by explicit gas limits
-                if (executionGasLimit > executionGasUsed) {
-                    uint256 unusedGas = executionGasLimit - executionGasUsed;
-                    uint256 unusedGasPenalty = (unusedGas * PENALTY_PERCENT) / 100;
-                    actualGas += unusedGasPenalty;
-                }
-            }
-
+            actualGas += preGas - gasleft() + postOpUnusedGasPenalty;
             actualGasCost = actualGas * gasPrice;
             uint256 prefund = opInfo.prefund;
             if (prefund < actualGasCost) {
@@ -796,5 +815,16 @@ contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard,
     function delegateAndRevert(address target, bytes calldata data) external {
         (bool success, bytes memory ret) = target.delegatecall(data);
         revert DelegateAndRevert(success, ret);
+    }
+
+    function _getUnusedGasPenalty(uint256 gasUsed, uint256 gasLimit) internal pure returns (uint256) {
+        unchecked {
+            if (gasLimit <= gasUsed) {
+                return 0;
+            }
+            uint256 unusedGas = gasLimit - gasUsed;
+            uint256 unusedGasPenalty = (unusedGas * PENALTY_PERCENT) / 100;
+            return unusedGasPenalty;
+        }
     }
 }
